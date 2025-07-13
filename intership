@@ -1,0 +1,212 @@
+main 
+
+
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from rag_utils import extract_text_from_pdfs, chunk_text, save_vectors_simple, get_chat_response, text_to_speech, transcribe_with_assemblyai
+from fastapi import UploadFile, File, HTTPException
+from fastapi.responses import FileResponse
+import uuid
+import os
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 🔧 Setup temp folder
+TEMP_DIR = "temp_audio"
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+@app.post("/upload-pdf")
+async def upload_pdf(file: UploadFile = File(...)):
+    if not file.filename.endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+
+    try:
+        # Step 1: Read file in-memory
+        text = extract_text_from_pdfs([file.file])
+        
+        # Step 2: Chunk text
+        chunks = chunk_text(text)
+
+        # Step 3: Embed and store in FAISS (no metadata)
+        save_vectors_simple(chunks)
+
+        return {"message": "PDF processed and stored in vector DB."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
+
+
+
+
+@app.get("/chat")
+async def chat(question: str):
+    try:
+        answer = get_chat_response(question)
+        return {"question": question, "answer": answer}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/voice-chat")
+async def voice_chat(audio: UploadFile = File(...)):
+    try:
+        # Step 1: Save uploaded audio
+        uid = str(uuid.uuid4())
+        input_audio_path = os.path.join(TEMP_DIR, f"{uid}.wav")
+        with open(input_audio_path, "wb") as f:
+            f.write(await audio.read())
+
+        # Step 2: Transcribe using AssemblyAI
+        question_text = transcribe_with_assemblyai(input_audio_path)
+
+        # Step 3: Get RAG answer
+        answer_text = get_chat_response(question_text)
+
+        # Step 4: Convert to voice
+        output_audio_path = text_to_speech(answer_text, f"{uid}_reply.mp3")
+
+        # Step 5: Return audio response
+        return FileResponse(output_audio_path, media_type="audio/mpeg", filename="response.mp3")
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+rag
+
+import os
+from PyPDF2 import PdfReader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_google_genai import ChatGoogleGenerativeAI
+from dotenv import load_dotenv
+from langchain.schema import AIMessage, HumanMessage
+from langchain_core.prompts import PromptTemplate
+from langchain_community.vectorstores import FAISS
+import assemblyai as aai
+from elevenlabs.client import ElevenLabs
+from elevenlabs import save
+
+
+load_dotenv()
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+
+# 🔐 Set your AssemblyAI API Key
+aai.settings.api_key = "b49fff204f2b478b99fabe619efe81eb" # 🔁 Replace with real key
+elevenlabs = ElevenLabs(
+    api_key=os.getenv("ELEVEN_API_KEY")  # Or hardcode your API key (not recommended)
+)
+
+# Initialize shared objects
+_embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+_model = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0)
+_index_path = "faiss_index"                       
+memory = []
+
+TEMP_DIR = "temp_audio"
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+def extract_text_from_pdfs(pdf_files):
+    text = ""
+    for file in pdf_files:
+        pdf_reader = PdfReader(file)
+        for page in pdf_reader.pages:
+            text += page.extract_text() or ""
+    return text
+
+def chunk_text(text, chunk_size=1000, chunk_overlap=100):
+    splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    return splitter.split_text(text)
+
+def save_vectors_simple(chunks):
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+    vector_store = FAISS.from_texts(chunks, embedding=embeddings)
+
+    index_path = "faiss_index"
+    vector_store.save_local(index_path)
+
+
+def get_chat_response(question: str) -> str:
+    if not os.path.exists(os.path.join(_index_path, "index.faiss")):
+        raise ValueError("Vector store not found.")
+
+    vectordb = FAISS.load_local(_index_path, _embeddings, allow_dangerous_deserialization=True)
+    retriever = vectordb.as_retriever()
+
+    # Build context from previous messages
+    chat_context = ""
+    for msg in memory:
+        role = "You" if isinstance(msg, HumanMessage) else "Bot"
+        chat_context += f"{role}: {msg.content}\n"
+    chat_context += f"You: {question}"
+
+    prompt = PromptTemplate(
+        template="""
+You are a helpful assistant. Use the context chunks to answer the user's question clearly.
+If the answer is not in the context, say so. Use prior conversation to improve relevance.
+
+Context:
+{context}
+
+Chat History:
+{history}
+
+Current Question:
+{question}
+
+Answer:""",
+        input_variables=["context", "history", "question"]
+    )
+
+    docs = retriever.get_relevant_documents(question)
+    context_text = "\n\n".join([doc.page_content for doc in docs])
+
+    model = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0)
+    chain = (
+    {
+        "context": lambda x: x["context"],
+        "question": lambda x: x["question"],
+        "history": lambda x: x["history"]
+    }
+    | prompt
+    | model
+)
+
+    result = chain.invoke({
+    "context": context_text,
+    "history": chat_context,
+    "question": question
+    })
+
+    memory.append(HumanMessage(content=question))
+    memory.append(AIMessage(content=result.content))  # ✅ Only the text
+    return result.content
+
+
+
+# 🔊 Transcribe using AssemblyAI
+def transcribe_with_assemblyai(audio_path):
+    transcriber = aai.Transcriber()
+    transcript = transcriber.transcribe(audio_path)
+    if not transcript.text.strip():
+        raise ValueError("No speech recognized.")
+    return transcript.text.strip()
+
+# 🗣️ Convert text to audio using gTTS
+def text_to_speech(text, filename):
+    audio_stream = elevenlabs.text_to_speech.stream(
+        text=text,
+        voice_id="JBFqnCBsd6RMkjVDRZzb",  # Your preferred voice
+        model_id="eleven_multilingual_v2"
+    )
+
+    output_path = os.path.join("temp_audio", filename)
+    save(audio_stream, output_path)
+    return output_path
+
+env
+GOOGLE_API_KEY = "AIzaSyDxyWYwvLnK-w826MPrmOhFuzSOhtWg7WE"
