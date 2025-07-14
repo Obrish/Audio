@@ -210,3 +210,4 @@ def text_to_speech(text, filename):
 
 env
 GOOGLE_API_KEY = "AIzaSyDxyWYwvLnK-w826MPrmOhFuzSOhtWg7WE"
+ELEVEN_API_KEY = "sk_b6533647788d716f0e691808ff821207230b541b68b3cc78"
